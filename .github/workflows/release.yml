@@ -18,16 +18,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
-
-      - name: Build exe
-        run: >
-          pyinstaller --onefile --noconsole --clean
-          --name GameLarper
-          --icon icons/app.ico
-          --add-data "icons;icons"
-          GameLarper.py
+      - name: Build exe (bundles discord.py-self, curl_cffi, discord_protos, tzdata)
+        run: python Build/build_exe.py
 
       - name: Smoke test (exe must start and stay up)
         shell: pwsh
