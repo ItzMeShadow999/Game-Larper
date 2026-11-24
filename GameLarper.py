@@ -1,27 +1,15 @@
 #!/usr/bin/env python3
-"""
-Game Larper
-
-Pick games from Discord's public detectable games catalog, choose how long
-each one "runs", and the app starts a harmless stand-in process named like the
-game's real executable (for example hades.exe) so Discord's own game detection
-picks it up locally. Nothing is sent to Discord by this app. No token, no
-cookie, no telemetry.
-
-Run:    python GameLarper.py
-Build:  pip install pyinstaller
-        pyinstaller --onefile --noconsole GameLarper.py
-
-Windows and Linux. Python 3.9+. Only the standard library (tkinter included).
-"""
 from __future__ import annotations
-
+import asyncio
 import atexit
+import base64
+import contextvars
 import json
 import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -31,13 +19,13 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 from tkinter import font as tkfont, ttk
 import tkinter as tk
 
 FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 CACHE_PATH = APP_DIR / "games.json"
-
 
 def _work_base() -> str | None:
     """Folder where stand-in exes are created: the user's Downloads folder."""
@@ -61,22 +49,384 @@ IS_WINDOWS = os.name == "nt"
 PLATFORM_KEY = "win32" if IS_WINDOWS else "linux"
 DEFAULT_MINUTES = "1"
 GAP_SECONDS = 3.0
+
+DEBUG_PORT = 9222
+PLATFORMS = {
+    "Windows": "Discord Client", "Xbox": "Discord Embedded", "PlayStation": "Discord Embedded",
+    "Android": "Discord Android", "iOS": "Discord iOS", "Web": "Discord Web", "VR": "Discord VR",
+}
+_PLATFORM_JS = """((b) => {
+  const W = window.webpackChunkdiscord_app, M = W.push([[Symbol()], {}, r => r.c]); W.pop();
+  let G;
+  for (const m of Object.values(M)) {
+    try {
+      const e = m.exports; if (!e || e === window) continue;
+      for (const t of [e, e.default, ...Object.values(e)])
+        if (t && t !== window && t[Symbol.toStringTag] !== "IntlMessagesProxy" && "getSocket" in Object(t)) { G = t; break; }
+    } catch {}
+    if (G) break;
+  }
+  const s = G.getSocket(), L = window.__larp || (window.__larp = { o: s.send });
+  L.b = b;
+  if (s.send === L.o) s.send = function (op, d, ...a) {
+    if (op === 2 && d && d.properties) d = { ...d, properties: { ...d.properties, browser: L.b } };
+    return Reflect.apply(L.o, this, [op, d, ...a]);
+  };
+  s.sessionId = null; s.seq = 0;
+  const w = s.webSocket; if (w && w.readyState < WebSocket.CLOSING) w.close(1000);
+  return "ok";
+})(%s)"""
+
+def _ws_recv(s: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("debug socket closed")
+        buf += chunk
+    return buf
+
+def cdp_eval(expr: str) -> str:
+    """Run JS inside Discord's page over the debug port (tiny stdlib websocket client)."""
+    tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{DEBUG_PORT}/json", timeout=3))
+    tab = next(t for t in tabs if t.get("type") == "page" and "discord.com" in t.get("url", "")
+               and t.get("webSocketDebuggerUrl"))
+    u = urlparse(tab["webSocketDebuggerUrl"])
+    s = socket.create_connection((u.hostname, u.port), timeout=5)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        s.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.netloc}\r\nUpgrade: websocket\r\n"
+                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += _ws_recv(s, 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise ConnectionError(head.split(b"\r\n")[0].decode(errors="replace"))
+        body = json.dumps({"id": 1, "method": "Runtime.evaluate",
+                           "params": {"expression": expr, "returnByValue": True}}).encode()
+        n, mask = len(body), os.urandom(4)
+        ln = bytes([0x80 | n]) if n < 126 else b"\xfe" + n.to_bytes(2, "big") if n < 65536 else b"\xff" + n.to_bytes(8, "big")
+        s.sendall(b"\x81" + ln + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(body)))
+
+        b1 = _ws_recv(s, 2)[1] & 0x7F
+        b1 = int.from_bytes(_ws_recv(s, 2), "big") if b1 == 126 else int.from_bytes(_ws_recv(s, 8), "big") if b1 == 127 else b1
+        res = json.loads(_ws_recv(s, b1))["result"]
+        if "exceptionDetails" in res:
+            raise RuntimeError(res["exceptionDetails"].get("exception", {}).get("description", "script error"))
+        return str(res["result"].get("value"))
+    finally:
+        s.close()
+
+def set_platform(name: str) -> None:
+    cdp_eval(_PLATFORM_JS % json.dumps(PLATFORMS[name]))
+
+TOKEN_SNIPPET = ("copy(((w=webpackChunkdiscord_app).push([[Symbol()],{},o=>{try{Object.values(o.c).some("
+                 "e=>e.exports?.setToken&&(w.t=e.exports.getToken()))}catch{}}]),w.t))")
+TOKEN_FILE = APP_DIR / "token.dat"
+_KEYRING = ["service", "gamelarper", "account", "default"]
+GATEWAY_HOST = "gateway.discord.gg"
+GATEWAY_PATH = "/?v=9&encoding=json"
+
+GW_PROPS = {
+    "Windows": {
+        "os": "Windows",
+        "browser": "Discord Client",
+        "device": "",
+        "system_locale": "en-US",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "browser_version": "124.0.0.0",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": ""
+    },
+    "Xbox": {
+        "os": "Console",
+        "browser": "Discord Embedded",
+        "device": "Xbox Series X",
+        "system_locale": "en-US",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Xbox; Xbox Series X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.10586",
+        "browser_version": "",
+        "os_version": "",
+        "referrer": "",
+        "referring_domain": ""
+    },
+    "PlayStation": {
+        "os": "Console",
+        "browser": "Discord Embedded",
+        "device": "PlayStation 5",
+        "system_locale": "en-US",
+        "browser_user_agent": "Mozilla/5.0 (PlayStation 5 3.11) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+        "browser_version": "",
+        "os_version": "",
+        "referrer": "",
+        "referring_domain": ""
+    },
+    "Android": {
+        "os": "Android",
+        "browser": "Discord Android",
+        "device": "Pixel 8",
+        "system_locale": "en-US",
+        "browser_user_agent": "Discord-Android/214116;ROM:13;Device:Pixel 8",
+        "browser_version": "214.116",
+        "os_version": "13",
+        "referrer": "",
+        "referring_domain": ""
+    },
+    "iOS": {
+        "os": "iOS",
+        "browser": "Discord iOS",
+        "device": "iPhone16,2",
+        "system_locale": "en-US",
+        "browser_user_agent": "Discord/268.0 CFNetwork/1474 Darwin/23.0.0",
+        "browser_version": "268.0",
+        "os_version": "17.4.1",
+        "referrer": "",
+        "referring_domain": ""
+    },
+    "Web": {
+        "os": "Windows",
+        "browser": "Discord Web",
+        "device": "",
+        "system_locale": "en-US",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "browser_version": "124.0.0.0",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": ""
+    },
+    "VR": {
+        "os": "Console",
+        "browser": "Discord VR",
+        "device": "VR-Headset",
+        "system_locale": "en-US",
+        "browser_user_agent": "DiscordVR/12.45",
+        "browser_version": "23.7.91",
+        "os_version": "10.0.45",
+        "referrer": "",
+        "referring_domain": ""
+    }
+}
+
+class TokenStoreError(Exception):
+    pass
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    inb = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = Blob()
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(inb), None, None, None, None, 0, ctypes.byref(out)):
+        raise TokenStoreError("Windows DPAPI call failed")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+def _secret_tool(*args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+    if not shutil.which("secret-tool"):
+        raise TokenStoreError("secret-tool (libsecret) not found, so nothing was saved")
+    return subprocess.run(["secret-tool", *args], input=stdin, capture_output=True, timeout=15)
+
+def token_save(token: str) -> None:
+    if IS_WINDOWS:
+        TOKEN_FILE.write_text(base64.b64encode(_dpapi(token.encode(), True)).decode(), encoding="ascii")
+        return
+    r = _secret_tool("store", "--label=Game Larper", *_KEYRING, stdin=token.encode())
+    if r.returncode:
+        raise TokenStoreError("the keyring refused the token (is a keyring unlocked?)")
+
+def token_load() -> str | None:
+    if IS_WINDOWS:
+        if not TOKEN_FILE.exists():
+            return None
+        return _dpapi(base64.b64decode(TOKEN_FILE.read_text(encoding="ascii")), False).decode()
+    r = _secret_tool("lookup", *_KEYRING)
+    return r.stdout.decode().strip() or None if r.returncode == 0 else None
+
+def token_forget() -> None:
+    if IS_WINDOWS:
+        TOKEN_FILE.unlink(missing_ok=True)
+    else:
+        _secret_tool("clear", *_KEYRING)
+
+_PLATFORM_CTX = contextvars.ContextVar("larper_platform", default="Windows")
+_IDENTIFY_PATCHED = False
+
+DEPS_DIR = APP_DIR / "larper_deps"  
+_PROBE = ("import discord, sys\nfrom discord.gateway import DiscordWebSocket\n"
+          "sys.exit(0 if 'self' in str(getattr(discord, '__title__', '')) else 3)")
+_NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+
+def _use_deps_dir() -> None:
+    """Put the private deps folder first on sys.path (before discord is ever imported in this process)."""
+    d = str(DEPS_DIR)
+    if DEPS_DIR.exists() and d not in sys.path:
+        sys.path.insert(0, d)
+        import importlib
+        importlib.invalidate_caches()
+
+def _pip_python() -> str:
+    exe = Path(sys.executable)
+    if IS_WINDOWS and exe.name.lower() == "pythonw.exe" and exe.with_name("python.exe").exists():
+        return str(exe.with_name("python.exe"))
+    return str(exe)
+
+def selfbot_missing() -> str | None:
+    """None if discord.py-self is usable, else a short reason. Checked in a subprocess so a wrong or broken
+    global 'discord' package never gets imported into this process."""
+    _use_deps_dir()
+    if FROZEN:  
+        try:
+            import discord
+            from discord.gateway import DiscordWebSocket  
+            return None if "self" in str(getattr(discord, "__title__", "")) else "wrong 'discord' package"
+        except Exception as exc:
+            return str(exc)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(x for x in (str(DEPS_DIR) if DEPS_DIR.exists() else "", env.get("PYTHONPATH", "")) if x)
+    try:
+        r = subprocess.run([_pip_python(), "-c", _PROBE], capture_output=True, text=True, timeout=90, env=env,
+                           creationflags=_NOWIN)
+    except Exception as exc:
+        return f"could not check: {exc}"
+    if r.returncode == 0:
+        return None
+    if r.returncode == 3:
+        return "the wrong 'discord' package is first on the path (need discord.py-self)"
+    lines = r.stderr.strip().splitlines()
+    return lines[-1] if lines else "import failed"
+
+def install_selfbot() -> tuple[bool, str]:
+    """pip install discord.py-self into DEPS_DIR (never touches or removes anything in the global Python).
+    A broken private folder is wiped and retried once."""
+    if FROZEN:
+        return False, "this .exe was built without discord.py-self (rebuild it with build_exe.bat)"
+    detail = ""
+    for attempt in (1, 2):
+        try:
+            r = subprocess.run([_pip_python(), "-m", "pip", "install", "--upgrade", "--no-input",
+                                "--disable-pip-version-check", "--target", str(DEPS_DIR), "discord.py-self"],
+                               capture_output=True, text=True, timeout=900, creationflags=_NOWIN)
+            out = (r.stderr.strip() or r.stdout.strip()).splitlines()
+            detail = out[-1] if out else f"pip exit code {r.returncode}"
+        except Exception as exc:
+            detail = str(exc)
+        _use_deps_dir()
+        missing = selfbot_missing()
+        if missing is None:
+            return True, ""
+        detail = f"{detail} | {missing}"
+        if attempt == 1:
+            shutil.rmtree(DEPS_DIR, ignore_errors=True)  
+    return False, detail
+
+def _install_identify_patch() -> None:
+    """Make every gateway IDENTIFY use the platform of the current context (as spoofer's spoof.py does)."""
+    global _IDENTIFY_PATCHED
+    if _IDENTIFY_PATCHED:
+        return
+    from discord.gateway import DiscordWebSocket
+
+    async def identify(self) -> None:
+        await self.send(json.dumps({"op": self.IDENTIFY, "d": {
+            "token": self.token, "capabilities": 4093, "properties": GW_PROPS[_PLATFORM_CTX.get()],
+            "compress": False,
+            "client_state": {"guild_versions": {}, "highest_last_message_id": "0", "read_state_version": 0,
+                             "user_guild_settings_version": -1, "user_settings_version": -1,
+                             "private_channels_version": "0", "api_code_version": 0}}}))
+
+    DiscordWebSocket.identify = identify
+    _IDENTIFY_PATCHED = True
+
+class GatewaySession(threading.Thread):
+    """One discord.py-self client reporting one platform and playing the games assigned to it."""
+
+    def __init__(self, token: str, platform: str, log) -> None:
+        super().__init__(daemon=True)
+        self._token, self.platform, self._log = token, platform, log
+        self.games: list[Game] = []
+        self.ready = threading.Event()
+        self.stop_evt = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._client = None
+
+    def set_games(self, games: list[Game]) -> None:
+        self.games = list(games)
+        if self._loop and self._client and self.ready.is_set():
+            asyncio.run_coroutine_threadsafe(self._apply(), self._loop)
+
+    def finish(self) -> None:
+        """Clear the presence, then close the session."""
+        self.games = []
+        self.stop_evt.set()
+        loop, client = self._loop, self._client
+        if loop and client:
+            async def stop() -> None:
+                await self._apply()
+                await client.close()
+            asyncio.run_coroutine_threadsafe(stop(), loop)
+
+    async def _apply(self) -> None:
+        import discord
+        acts = [discord.Activity(type=discord.ActivityType.playing, name=g.name,
+                                 application_id=int(g.app_id) if g.app_id.isdigit() else None)
+                for g in self.games]
+        try:
+            await self._client.change_presence(activities=acts)
+        except Exception as exc:
+            self._log(f"[{self.platform}] presence not applied: {exc}")
+
+    async def _main(self) -> None:
+        import discord
+        sess = self
+
+        class PlatformClient(discord.Client):
+            async def on_ready(self) -> None:
+                sess.ready.set()
+                sess._log(f"[{sess.platform}] session ready")
+                if sess.stop_evt.is_set():
+                    await self.close()
+                    return
+                await sess._apply()
+
+        self._loop = asyncio.get_running_loop()
+        self._client = PlatformClient()
+        try:
+            await self._client.start(self._token)
+        except discord.LoginFailure:
+            self._log(f"FAILED [{self.platform}] token rejected by Discord")
+        finally:
+            self.ready.clear()
+
+    def run(self) -> None:
+        _PLATFORM_CTX.set(self.platform)  
+        try:
+            _use_deps_dir()
+            _install_identify_patch()
+            asyncio.run(self._main())
+        except Exception as exc:
+            self._log(f"FAILED [{self.platform}] {exc}")
+
 MAX_QUEUE_RANDOM = 500
 GRAPH_W = 420
 SLIDE_MS = 450
 SLIDE_HOLD_MS = 1200
 SPIN_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 
-
 @dataclass
 class Game:
     name: str
     exe: str
-
-
+    app_id: str = ""
 
 _NAME_RE = re.compile(rb'"name":\s*"([^"]+)"')
-
 
 def _download_catalog(progress=None) -> list:
     """Download the catalog. progress(done_bytes, total_bytes) is called per chunk (total 0 = unknown)."""
@@ -100,7 +450,6 @@ def _download_catalog(progress=None) -> list:
             last_err = exc
     raise RuntimeError(f"Could not download the games catalog: {last_err}")
 
-
 def _clean_exe_name(raw: str) -> str | None:
     name = raw.strip()
     if name.startswith(">"):
@@ -110,7 +459,6 @@ def _clean_exe_name(raw: str) -> str | None:
     if not parts or any(p in (".", "..") or ":" in p for p in parts):
         return None
     return "/".join(parts)
-
 
 def parse_catalog(raw: list) -> list[Game]:
     games: list[Game] = []
@@ -134,10 +482,9 @@ def parse_catalog(raw: list) -> list[Game]:
         if key in seen:
             continue
         seen.add(key)
-        games.append(Game(name=name, exe=chosen))
+        games.append(Game(name=name, exe=chosen, app_id=str(entry.get("id") or "")))
     games.sort(key=lambda g: g.name.lower())
     return games
-
 
 def load_catalog(force: bool = False, progress=None) -> list[Game]:
     raw = None
@@ -154,7 +501,6 @@ def load_catalog(force: bool = False, progress=None) -> list[Game]:
             pass
     return parse_catalog(raw)
 
-
 def folder_variant(game: Game) -> str | None:
     """Path ending of the form 'Game Folder/exe', used by Discord for folder-name matching."""
     folder = "".join(c for c in game.name if c not in '<>:"/\\|?*').strip().rstrip(".")
@@ -164,10 +510,7 @@ def folder_variant(game: Game) -> str | None:
     cand = f"{folder}/{base}"
     return cand if cand.lower() != game.exe.lower() else None
 
-
-
 OWN_STUB_NAME = "larper_window_stub_v4.exe"
-
 
 def _find_icons_dir() -> Path:
     """Find the icons folder: next to the app, inside a PyInstaller bundle, next to the script, or cwd."""
@@ -180,7 +523,6 @@ def _find_icons_dir() -> Path:
         if c.is_dir():
             return c
     return cands[0]
-
 
 ICONS_DIR = _find_icons_dir()
 STUB_SOURCE = r'''using System;
@@ -204,7 +546,6 @@ static class P {
 MINIMIZE_WINDOWS = False
 CUSTOM_STUB = ""
 
-
 def _find_csc() -> str | None:
     windir = os.environ.get("SystemRoot", r"C:\Windows")
     for fw in ("Framework64", "Framework"):
@@ -212,7 +553,6 @@ def _find_csc() -> str | None:
         if os.path.exists(path):
             return path
     return None
-
 
 def ensure_own_stub() -> Path | None:
     """Compile a tiny windowless exe once with the .NET compiler built into Windows."""
@@ -251,7 +591,6 @@ def ensure_own_stub() -> Path | None:
             except Exception:
                 pass
 
-
 def _stub_candidates() -> list[tuple[str, list[str], bool]]:
     """Return (binary to copy, args, needs_stdin_pipe) in order of preference."""
     out: list[tuple[str, list[str], bool]] = []
@@ -278,7 +617,6 @@ def _stub_candidates() -> list[tuple[str, list[str], bool]]:
     if not FROZEN:
         out.append((sys.executable, ["-c", "import time; time.sleep(10**9)"], False))
     return out
-
 
 class FakeGame:
     def __init__(self, game: Game) -> None:
@@ -352,10 +690,8 @@ class FakeGame:
                 shutil.rmtree(self.root, ignore_errors=True)
             self.root = None
 
-
 ACTIVE: list[FakeGame] = []
 ACTIVE_LOCK = threading.Lock()
-
 
 def _cleanup_all() -> None:
     with ACTIVE_LOCK:
@@ -364,20 +700,15 @@ def _cleanup_all() -> None:
     for item in items:
         item.stop()
 
-
 atexit.register(_cleanup_all)
-
-
 
 def _rrect(px, py, x0, y0, x1, y1, r) -> bool:
     cx = min(max(px, x0 + r), x1 - r)
     cy = min(max(py, y0 + r), y1 - r)
     return (px - cx) ** 2 + (py - cy) ** 2 <= r * r
 
-
 def _circ(px, py, cx, cy, r) -> bool:
     return (px - cx) ** 2 + (py - cy) ** 2 <= r * r
-
 
 def icon_color(px: float, py: float) -> str | None:
     """Colour of the app icon at a point in a 64x64 space, or None for transparent."""
@@ -398,8 +729,6 @@ def icon_color(px: float, py: float) -> str | None:
         return "#ffffff"
     return "#4f46e5"
 
-
-
 def load_app_icons() -> list:
     """Load icon_*.png from the icons folder; fall back to the drawn icon if missing."""
     out = []
@@ -409,7 +738,6 @@ def load_app_icons() -> list:
     except Exception:
         out = []
     return out
-
 
 def build_icon(size: int) -> tk.PhotoImage:
     img = tk.PhotoImage(width=size, height=size)
@@ -425,7 +753,6 @@ def build_icon(size: int) -> tk.PhotoImage:
                 img.put(col, to=(x, y, x2, y + 1))
             x = x2
     return img
-
 
 def set_window_icon(root) -> None:
     """Windows: force the title-bar and taskbar icon straight from icons/app.ico (WM_SETICON)."""
@@ -456,7 +783,6 @@ def set_window_icon(root) -> None:
     except Exception:
         pass
 
-
 def set_app_identity() -> None:
     """Give the process its own taskbar identity so Windows does not group it under Python."""
     if not IS_WINDOWS:
@@ -467,16 +793,12 @@ def set_app_identity() -> None:
     except Exception:
         pass
 
-
-
 BG, PANEL, FG, DIM = "#0A0A0A", "#121212", "#EAEAEA", "#7A7A7A"
 LINE, ACCENT, GREEN = "#3A3A3A", "#E61919", "#4AF626"
 MONO, HEAD = "Courier", "Helvetica"
 
-
 def mono(size: int = 9, bold: bool = False) -> tuple:
     return (MONO, size, "bold") if bold else (MONO, size)
-
 
 def apply_theme(root: tk.Tk) -> None:
     global MONO, HEAD
@@ -544,7 +866,6 @@ def apply_theme(root: tk.Tk) -> None:
            lightcolor=[("pressed", ACCENT), ("active", FG)],
            darkcolor=[("pressed", ACCENT), ("active", FG)])
 
-
 def dark_titlebar(root: tk.Tk) -> None:
     """Windows 10/11: dark caption, red hairline border, light caption text. Silent no-op elsewhere."""
     if not IS_WINDOWS:
@@ -558,11 +879,9 @@ def dark_titlebar(root: tk.Tk) -> None:
     except Exception:
         pass
 
-
 def _label(parent, text: str = "", fg: str = FG, bg: str = BG, size: int = 9,
            bold: bool = False, **kw) -> tk.Label:
     return tk.Label(parent, text=text, fg=fg, bg=bg, font=mono(size, bold), **kw)
-
 
 def _panel(parent, title: str) -> tuple:
     """Titled panel: (outer, body, right_label). A red tab marks the header."""
@@ -580,14 +899,12 @@ def _panel(parent, title: str) -> tuple:
     body.grid(row=2, column=0, sticky="nsew")
     return outer, body, right
 
-
 def _boxed(parent, title: str) -> tuple:
     """A panel inside a 1px line-coloured frame."""
     box = tk.Frame(parent, bg=LINE)
     outer, body, right = _panel(box, title)
     outer.pack(fill="both", expand=True, padx=1, pady=1)
     return box, body, right
-
 
 class RowList(tk.Frame):
     """Canvas list with the Listbox calls the app uses (insert, delete, curselection, bind).
@@ -642,10 +959,10 @@ class RowList(tk.Frame):
         return tuple(sorted(self.sel))
 
     def _visible(self) -> int:
-        return max(1, self.cv.winfo_height() // self.RH)
+        return max(1, self.cv.winfo_height() 
 
     def _index(self, y: int) -> int:
-        i = self.top + y // self.RH
+        i = self.top + y 
         return i if y >= 0 and i < len(self.items) else -1
 
     def _clamp_top(self) -> None:
@@ -693,7 +1010,7 @@ class RowList(tk.Frame):
         y = e.y
         if y < 0 or y > self.cv.winfo_height():
             self._scroll(-1 if y < 0 else 1)
-        i = max(0, min(len(self.items) - 1, self.top + y // self.RH))
+        i = max(0, min(len(self.items) - 1, self.top + y 
         a, b = sorted((self.anchor, i))
         rng = set(range(a, b + 1))
         self.sel = self._base | rng if self._paint else self._base - rng
@@ -734,7 +1051,7 @@ class RowList(tk.Frame):
             on = i in self.sel
             if on:
                 cv.create_rectangle(0, y, w, y + self.RH, fill=ACCENT, outline="")
-            cv.create_text(8, y + self.RH // 2, text=self.items[i], anchor="w", font=mono(),
+            cv.create_text(8, y + self.RH 
                            fill=BG if on else FG)
         if self.top <= self.hot < min(n, self.top + vis + 1):
             self._pop(self.hot, w)
@@ -756,15 +1073,13 @@ class RowList(tk.Frame):
         right = [(x0 + x1 - px, y0 + y1 - py) for px, py in left]
         cv.create_polygon(left, fill=bar, outline="")
         cv.create_polygon(right, fill=bar, outline="")
-        cv.create_text(14, y0 + self.RH // 2, text=self.items[i], anchor="w", font=mono(),
+        cv.create_text(14, y0 + self.RH 
                        fill=BG if on else FG)
-
 
 def _listbox(parent, row: int) -> RowList:
     lb = RowList(parent)
     lb.grid(row=row, column=0, sticky="nsew", padx=8)
     return lb
-
 
 def _stripes(cv: tk.Canvas) -> None:
     """Hazard stripes, redrawn on resize."""
@@ -773,7 +1088,6 @@ def _stripes(cv: tk.Canvas) -> None:
     for x in range(-h, w + h, step * 2):
         cv.create_polygon(x, h, x + step, h, x + step + h, 0, x + h, 0, fill=ACCENT, outline="")
 
-
 def _barcode(cv: tk.Canvas) -> None:
     rng = random.Random(26)
     x = 0
@@ -781,8 +1095,6 @@ def _barcode(cv: tk.Canvas) -> None:
         w = rng.choice((1, 1, 2, 3))
         cv.create_rectangle(x, 0, x + w, 30, fill=FG, outline="")
         x += w + rng.choice((1, 2, 2, 3))
-
-
 
 class SpeedGraph(tk.Canvas):
     """Live download-speed graph (ping-monitor look) in the red theme.
@@ -806,7 +1118,6 @@ class SpeedGraph(tk.Canvas):
         self.state = "IDLE"
         self.bind("<Configure>", lambda _e: self.redraw())
         self.after(self.STEP_MS, self._tick)
-
 
     def feed(self, done_bytes: int) -> None:
         self._done = done_bytes
@@ -838,7 +1149,6 @@ class SpeedGraph(tk.Canvas):
             self.redraw()
         self.after(self.STEP_MS, self._tick)
 
-
     @staticmethod
     def _fmt(v: float) -> str:
         if v >= 1048576:
@@ -855,7 +1165,7 @@ class SpeedGraph(tk.Canvas):
         if w < 120 or h < 70:
             return
         left, top, right, bottom = 50, 22, w - 10, h - 18
-        fit = int((right - left) // self.PX) + 1
+        fit = int((right - left) 
         shown = list(self.samples)[-fit:]
         vals = [v for _, v in shown]
         n = len(vals)
@@ -889,9 +1199,9 @@ class SpeedGraph(tk.Canvas):
                 self.create_line(x, y, x, bottom - 1, fill="#5C1010", dash=(1, 2))
                 pts += [x, y]
             self.create_line(*pts, fill=ACCENT, width=1)
-            prev = int(shown[0][0]) // 5
+            prev = int(shown[0][0]) 
             for k, (t, _v) in enumerate(shown):
-                cur = int(t) // 5
+                cur = int(t) 
                 if cur != prev:
                     x = left + k * self.PX
                     if left + 22 <= x <= right - 22:
@@ -904,7 +1214,6 @@ class SpeedGraph(tk.Canvas):
                              text="NO TRANSFER")
         self.create_text(right - 4, top + 4, anchor="ne", fill=ACCENT if self.active else DIM,
                          font=mono(7, True), text=f"\u25cf {self.state}  (BYTES/S)")
-
 
 class MsgDialog(tk.Toplevel):
     """Dark-mode stand-in for tkinter.messagebox (OK, or a YES/NO confirm)."""
@@ -939,8 +1248,8 @@ class MsgDialog(tk.Toplevel):
             self.bind("<Escape>", lambda _e: self.destroy())
 
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         self.grab_set()
@@ -954,20 +1263,16 @@ class MsgDialog(tk.Toplevel):
         self.result = False
         self.destroy()
 
-
 def show_info(parent, title: str, message: str) -> None:
     parent.wait_window(MsgDialog(parent, title, message, kind="info"))
 
-
 def show_error(parent, title: str, message: str) -> None:
     parent.wait_window(MsgDialog(parent, title, message, kind="error"))
-
 
 def ask_yesno(parent, title: str, message: str) -> bool:
     dlg = MsgDialog(parent, title, message, yesno=True)
     parent.wait_window(dlg)
     return dlg.result
-
 
 class StringDialog(tk.Toplevel):
     """Dark-mode stand-in for tkinter.simpledialog.askstring."""
@@ -996,8 +1301,8 @@ class StringDialog(tk.Toplevel):
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         entry.focus_set()
@@ -1008,12 +1313,10 @@ class StringDialog(tk.Toplevel):
         self.result = self.val.get().strip()
         self.destroy()
 
-
 def ask_string(parent, title: str, message: str, initial: str = "") -> str | None:
     dlg = StringDialog(parent, title, message, initial)
     parent.wait_window(dlg)
     return dlg.result or None
-
 
 class DurationDialog(tk.Toplevel):
     """Minutes for one game. result = (text, minutes or None, use_for_rest), or None if cancelled."""
@@ -1046,8 +1349,8 @@ class DurationDialog(tk.Toplevel):
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         entry.focus_set()
@@ -1068,15 +1371,119 @@ class DurationDialog(tk.Toplevel):
         self.result = (text, minutes, self.rest.get())
         self.destroy()
 
+class PlatformDialog(tk.Toplevel):
+    """Platform label for one game. result = (platform, use_for_rest), or None if cancelled."""
+
+    def __init__(self, parent, game: str, idx: int, total: int, initial: str) -> None:
+        super().__init__(parent, bg=BG)
+        self.title("Platform")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self.val = tk.StringVar(value=initial)
+        self.rest = tk.BooleanVar(value=False)
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(padx=16, pady=14)
+        _label(body, f"[{idx}/{total}]  {game}", fg=ACCENT, bold=True, anchor="w").pack(fill="x")
+        _label(body, "PLAY ON (STAND-IN MODE NEEDS DISCORD DEBUG PORT, SEE README)", fg=DIM, size=8, anchor="w").pack(
+            fill="x", pady=(8, 4))
+        for name in PLATFORMS:
+            tk.Radiobutton(body, text=name, value=name, variable=self.val, bg=BG, fg=FG, font=mono(),
+                           selectcolor=BG, activebackground=BG, activeforeground=ACCENT,
+                           highlightthickness=0, anchor="w").pack(fill="x")
+        if idx < total:
+            label = "USE THIS PLATFORM FOR ALL GAMES" if idx == 1 else "USE THIS PLATFORM FOR ALL REMAINING GAMES"
+            ttk.Checkbutton(body, text=label, variable=self.rest, style="Brut.TCheckbutton").pack(
+                anchor="w", pady=(10, 0))
+        row = tk.Frame(body, bg=BG)
+        row.pack(fill="x", pady=(14, 0))
+        ttk.Button(row, text="CANCEL", style="Brut.TButton", command=self.destroy).pack(side="right")
+        ttk.Button(row, text="OK ▸", style="Accent.Brut.TButton", command=self._ok).pack(side="right", padx=6)
+
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dark_titlebar(self)
+        self.grab_set()
+
+    def _ok(self) -> None:
+        self.result = (self.val.get(), self.rest.get())
+        self.destroy()
+
+class TokenDialog(tk.Toplevel):
+    """Token entry. result = ("save", token) | ("forget", "") | None."""
+
+    def __init__(self, parent, has_saved: bool) -> None:
+        super().__init__(parent, bg=BG)
+        self.title("Token")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self._parent = parent
+        self.val = tk.StringVar()
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(padx=16, pady=14)
+        _label(body, "THROWAWAY ACCOUNTS ONLY. A TOKEN IS FULL ACCESS TO THE ACCOUNT.", fg=ACCENT, bold=True,
+               anchor="w").pack(fill="x")
+        _label(body, "1. IN THE DISCORD CLIENT OPEN DEVTOOLS (CTRL+SHIFT+I) > CONSOLE\n"
+                     "2. PASTE THE SNIPPET BELOW, PRESS ENTER (IT COPIES YOUR TOKEN)\n"
+                     "3. PASTE THE TOKEN IN THE FIELD AT THE BOTTOM",
+               fg=DIM, size=8, anchor="w", justify="left").pack(fill="x", pady=(8, 6))
+        box = tk.Text(body, height=4, width=72, wrap="word", bg=PANEL, fg=FG, font=mono(9), relief="flat",
+                      borderwidth=0, highlightthickness=0, padx=8, pady=6)
+        box.insert("1.0", TOKEN_SNIPPET)
+        box.config(state="disabled")
+        box.pack(fill="x")
+        ttk.Button(body, text="COPY SNIPPET", style="Brut.TButton", command=self._copy).pack(anchor="w", pady=(6, 10))
+        ent = tk.Entry(body, textvariable=self.val, show="\u2022", width=72, bg=PANEL, fg=FG, font=mono(10),
+                       insertbackground=ACCENT, relief="flat", highlightthickness=1, highlightbackground=LINE,
+                       highlightcolor=ACCENT)
+        ent.pack(fill="x", ipady=4)
+        _label(body, "STORED ENCRYPTED ON THIS DEVICE (WINDOWS DPAPI / LINUX KEYRING). NEVER LOGGED.",
+               fg=DIM, size=8, anchor="w").pack(fill="x", pady=(6, 0))
+        row = tk.Frame(body, bg=BG)
+        row.pack(fill="x", pady=(14, 0))
+        ttk.Button(row, text="CANCEL", style="Brut.TButton", command=self.destroy).pack(side="right")
+        ttk.Button(row, text="SAVE ▸", style="Accent.Brut.TButton", command=self._ok).pack(side="right", padx=6)
+        if has_saved:
+            ttk.Button(row, text="FORGET SAVED TOKEN", style="Brut.TButton", command=self._forget).pack(side="left")
+
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dark_titlebar(self)
+        self.grab_set()
+        ent.focus_set()
+
+    def _copy(self) -> None:
+        self._parent.clipboard_clear()
+        self._parent.clipboard_append(TOKEN_SNIPPET)
+
+    def _ok(self) -> None:
+        tok = self.val.get().strip().strip("\"'")
+        if len(tok) >= 20 and " " not in tok:
+            self.result = ("save", tok)
+            self.destroy()
+
+    def _forget(self) -> None:
+        self.result = ("forget", "")
+        self.destroy()
 
 def center_window(root: tk.Tk, width: int, height: int) -> None:
     """Size the window and place it in the middle of the screen (shrinks to fit small screens)."""
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     width, height = min(width, sw - 40), min(height, sh - 80)
-    x = (sw - width) // 2
-    y = (sh - height) // 2 - 60
+    x = (sw - width) 
+    y = (sh - height) 
     root.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
-
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
@@ -1095,6 +1502,7 @@ class App:
         self.visible: list[Game] = []
         self.queue: list[Game] = []
         self.stop_evt = threading.Event()
+        self.plat_now = "Windows"  
         self.worker: threading.Thread | None = None
 
         self.search_var = tk.StringVar()
@@ -1104,11 +1512,13 @@ class App:
         self.count_var = tk.StringVar(value="")
         self.folder_var = tk.BooleanVar(value=False)
         self.min_var = tk.BooleanVar(value=False)
+        self.tok_mode = tk.BooleanVar(value=False)
+        self.token: str | None = None
+        self._deps_state: str | None = None
 
         self._build_ui()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self._load_games_thread, args=(not CACHE_PATH.exists(),), daemon=True).start()
-
 
     def _build_ui(self) -> None:
         root = self.root
@@ -1125,7 +1535,7 @@ class App:
         tk.Label(title, text="GAME", fg=FG, bg=BG, font=(HEAD, 26, "bold")).pack(side="left")
         tk.Label(title, text="LARPER", fg=ACCENT, bg=BG, font=(HEAD, 26, "bold")).pack(side="left", padx=(10, 0))
         _label(title, "™", fg=DIM, size=10).pack(side="left", anchor="n", pady=(6, 0))
-        _label(head, "◆ DISCORD DETECTABLE CATALOG   ▸ LOCAL STAND-INS   ▸ NO TOKEN, NO TELEMETRY",
+        _label(head, "◆ DISCORD DETECTABLE CATALOG   ▸ LOCAL STAND-INS   ▸ NO TELEMETRY   ▸ TOKEN OPTIONAL (ENCRYPTED)",
                fg=DIM, size=8).grid(row=1, column=0, sticky="w")
         right = tk.Frame(head, bg=BG)
         right.grid(row=0, column=2, rowspan=2, sticky="e")
@@ -1203,6 +1613,9 @@ class App:
                         style="Brut.TCheckbutton").pack(side="left")
         ttk.Button(opts, text="CHOOSE STUB EXE...", style="Brut.TButton", command=self.choose_stub).pack(
             side="left", padx=10)
+        ttk.Checkbutton(opts, text="TOKEN MODE (REAL SESSIONS)", variable=self.tok_mode,
+                        style="Brut.TCheckbutton").pack(side="left")
+        ttk.Button(opts, text="TOKEN...", style="Brut.TButton", command=self.edit_token).pack(side="left", padx=10)
 
         lbox, lbody, _ = _boxed(root, "04 / LOG")
         lbox.grid(row=4, column=0, sticky="ew", padx=14, pady=(10, 0))
@@ -1237,7 +1650,6 @@ class App:
         tk.Label(inner, textvariable=self.status_up, anchor="w", fg=FG, bg=PANEL, font=mono()).pack(
             side="left", fill="x", expand=True)
 
-
     def _load_games_thread(self, force: bool) -> None:
         est = CACHE_PATH.stat().st_size if CACHE_PATH.exists() else 6 * 1048576
 
@@ -1249,7 +1661,7 @@ class App:
                 self.root.after(0, self._download_begin)
             self.graph.feed(done)
             total = total or max(est, done)
-            pct = done * 100 // total if total else 0
+            pct = done * 100 
             self.live(name or "games.json", f"{done / 1048576:.1f}/{total / 1048576:.1f} MB {min(pct, 99):3d}%")
 
         before = CACHE_PATH.stat().st_mtime_ns if CACHE_PATH.exists() else None
@@ -1341,7 +1753,6 @@ class App:
             self.results.insert("end", g.name)
         self.count_var.set(f"{len(self.visible)} SHOWN")
 
-
     def _refresh_queue(self) -> None:
         self.queue_box.delete(0, "end")
         for g in self.queue:
@@ -1411,26 +1822,39 @@ class App:
         random.shuffle(self.queue)
         self._refresh_queue()
 
-
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
         if not self.queue:
             show_info(self.root, "Queue empty", "Add at least one game first.")
             return
+        use_token = False
+        if self.tok_mode.get():
+            ready = self._token_ready()
+            if ready is None:  
+                return
+            use_token = ready
+        skip_plat = self.tok_mode.get() and not use_token  
         batch = list(self.queue)
         durations: list[float | None] = []
-        text = DEFAULT_MINUTES
-        for i, g in enumerate(batch, 1):
-            dlg = DurationDialog(self.root, g.name, i, len(batch), text)
-            self.root.wait_window(dlg)
-            if dlg.result is None:
-                return
-            text, minutes, rest = dlg.result
+        platforms: list[str] = []
+        text, plat, minutes = DEFAULT_MINUTES, "Windows", None
+        time_all = plat_all = False
+        for i, g in enumerate(batch, 1):  
+            if not time_all:
+                dlg = DurationDialog(self.root, g.name, i, len(batch), text)
+                self.root.wait_window(dlg)
+                if dlg.result is None:
+                    return
+                text, minutes, time_all = dlg.result
             durations.append(minutes)
-            if rest:
-                durations += [minutes] * (len(batch) - i)
-                break
+            if not plat_all and not skip_plat:
+                pdlg = PlatformDialog(self.root, g.name, i, len(batch), plat)
+                self.root.wait_window(pdlg)
+                if pdlg.result is None:
+                    return
+                plat, plat_all = pdlg.result
+            platforms.append(plat)
 
         global MINIMIZE_WINDOWS
         MINIMIZE_WINDOWS = bool(self.min_var.get())
@@ -1438,7 +1862,8 @@ class App:
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.state_lbl.config(text="[ ACTIVE ]", fg=GREEN)
-        self.worker = threading.Thread(target=self._run, args=(batch, durations), daemon=True)
+        target = self._run_token if use_token else self._run
+        self.worker = threading.Thread(target=target, args=(batch, durations, platforms), daemon=True)
         self.worker.start()
 
     def stop(self) -> None:
@@ -1482,7 +1907,7 @@ class App:
         if not self._live_label:
             return
         name, stats = self._live_label
-        cols = max(30, (self.log_box.winfo_width() - 24) // self._cw - 3)
+        cols = max(30, (self.log_box.winfo_width() - 24) 
         room = cols - len(stats) - 1
         if len(name) > room:
             name = name[: max(1, room - 3)] + "..."
@@ -1498,6 +1923,137 @@ class App:
         self.log_box.xview_moveto(0)
         self.log_box.config(state="disabled")
         self.root.after(80, self._tick)
+
+    def edit_token(self) -> None:
+        try:
+            has = token_load() is not None
+        except Exception:
+            has = False
+        dlg = TokenDialog(self.root, has)
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+        kind, tok = dlg.result
+        if kind == "forget":
+            try:
+                token_forget()
+            except Exception as exc:
+                show_error(self.root, "Token", str(exc))
+            self.token = None
+            self.status_var.set("Saved token removed.")
+            return
+        self.token = tok
+        try:
+            token_save(tok)
+            self.status_var.set("Token saved, encrypted for this user.")
+        except Exception as exc:
+            show_error(self.root, "Token not saved", f"{exc}\n\nIt will be used for this session only.")
+
+    def _token_ready(self) -> bool | None:
+        """True: token mode can run. False: skip platform larp (reason is logged).
+        None: dependencies are being installed; start() is called again when that finishes."""
+        missing = selfbot_missing()
+        if missing:
+            if self._deps_state == "failed":
+                self._deps_state = None  
+                self.log(f"dependencies still missing ({missing}) | skipping platform larp")
+                return False
+            self._begin_install(missing)
+            return None
+        if not self.token:
+            try:
+                self.token = token_load()
+            except Exception as exc:
+                self.log(f"saved token not readable: {exc}")
+        if not self.token:
+            self.log("no token provided (add one with TOKEN...) | skipping platform larp")
+            return False
+        return True
+
+    def _begin_install(self, missing: str) -> None:
+        self.start_btn.config(state="disabled")
+        self.status_var.set("Installing discord.py-self (one time)...")
+        self.log(f"dependencies not found ({missing}). Installing discord.py-self into {DEPS_DIR.name}/ "
+                 "(one time; your global Python is not touched)")
+
+        def work() -> None:
+            ok, detail = install_selfbot()
+
+            def done() -> None:
+                self.start_btn.config(state="normal")
+                if ok:
+                    self._deps_state = None
+                    self.log("discord.py-self installed")
+                else:
+                    self._deps_state = "failed"
+                    self.log(f"FAILED auto-install: {detail}")
+                self.start()
+            self.root.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _run_token(self, batch: list[Game], durations: list[float | None], platforms: list[str]) -> None:
+        sessions: dict[str, GatewaySession] = {}
+
+        def sess(plat: str) -> GatewaySession:
+            s = sessions.get(plat)
+            if s is None:
+                s = sessions[plat] = GatewaySession(self.token or "", plat, self.log)
+                s.start()
+                s.ready.wait(15)
+                if not s.ready.is_set():
+                    self.log(f"[{plat}] not ready (bad token, or Discord refused the session)")
+            return s
+
+        try:
+            if all(d is None for d in durations):
+                groups: dict[str, list[Game]] = {}
+                for g, p in zip(batch, platforms):
+                    groups.setdefault(p, []).append(g)
+                for p, gs in groups.items():
+                    sess(p).set_games(gs)
+                    self.log(f"[{p}] playing " + ", ".join(g.name for g in gs))
+                self._set_status(f"Running {len(batch)} game(s) on {len(groups)} platform session(s) until you press Stop.")
+                while not self.stop_evt.is_set() and any(s.is_alive() for s in sessions.values()):
+                    n = sum(s.ready.is_set() for s in sessions.values())
+                    self.live(f"{len(batch)} games", f"{n}/{len(sessions)} sessions --%")
+                    self.stop_evt.wait(0.5)
+            else:
+                total = len(batch)
+                for i, g in enumerate(batch, 1):
+                    if self.stop_evt.is_set():
+                        break
+                    s = sess(platforms[i - 1])
+                    s.set_games([g])
+                    self.log(f"[{platforms[i - 1]}] playing {g.name}")
+                    minutes = durations[i - 1]
+                    end = None if minutes is None else time.time() + minutes * 60
+                    while not self.stop_evt.is_set():
+                        if end is None:
+                            left_txt = "until Stop"
+                        else:
+                            left = end - time.time()
+                            if left <= 0:
+                                break
+                            left_txt = f"{int(left)}s left"
+                        if not s.is_alive():
+                            self.log(f"{g.name} session ended early")
+                            break
+                        pct = "--" if end is None else f"{min(99, int((1 - left / (minutes * 60)) * 100)):3d}"
+                        self.live(g.name, f"{i}/{total} {pct}%")
+                        self._set_status(f"[{i}/{total}] {g.name} on {platforms[i - 1]}  {left_txt}")
+                        self.stop_evt.wait(1.0)
+                    self.end_live()
+                    s.set_games([])
+                    self.log(f"stopped {g.name}")
+                    if i < total and not self.stop_evt.is_set():
+                        self.stop_evt.wait(GAP_SECONDS)
+        finally:
+            self.end_live()
+            for s in sessions.values():
+                s.finish()
+            for s in sessions.values():
+                s.join(4)
+            self.root.after(0, self._finished)
 
     def _launch(self, game: Game) -> FakeGame | None:
         fake = FakeGame(game)
@@ -1531,10 +2087,26 @@ class App:
             if fake in ACTIVE:
                 ACTIVE.remove(fake)
 
-    def _run(self, batch: list[Game], durations: list[float | None]) -> None:
+    def _platform(self, name: str) -> None:
+        """Switch the platform Discord reports. Skipped if already set; a failure never stops the run."""
+        if name == self.plat_now:
+            return
+        try:
+            set_platform(name)
+        except Exception as exc:
+            self.log(f"platform {name} not applied: {exc} (start Discord with --remote-debugging-port={DEBUG_PORT})")
+            return
+        self.plat_now = name
+        self.log(f"platform -> {name}")
+        self.stop_evt.wait(GAP_SECONDS)  
+
+    def _run(self, batch: list[Game], durations: list[float | None], platforms: list[str]) -> None:
         try:
             if all(d is None for d in durations):
-                started = [f for g in batch for f in self._launch_all(g)]
+                if len(set(platforms)) > 1:  
+                    self.log(f"all games run together, using {platforms[0]} for all")
+                self._platform(platforms[0])
+                started =[f for g in batch for f in self._launch_all(g)]
                 self._set_status(f"Running {len(started)} game(s) until you press Stop.")
                 n = len(started)
                 while not self.stop_evt.is_set():
@@ -1547,6 +2119,7 @@ class App:
                 for i, g in enumerate(batch, 1):
                     if self.stop_evt.is_set():
                         break
+                    self._platform(platforms[i - 1])
                     fakes = self._launch_all(g)
                     if not fakes:
                         continue
@@ -1579,6 +2152,7 @@ class App:
         finally:
             self.end_live()
             _cleanup_all()
+            self._platform("Windows")  
             self.root.after(0, self._finished)
 
     def _finished(self) -> None:
@@ -1594,7 +2168,6 @@ class App:
             self.stop_evt.set()
         _cleanup_all()
         self.root.destroy()
-
 
 def _relaunch_without_console() -> None:
     """If started from a console (py.exe / python.exe), restart under pythonw.exe and exit."""
@@ -1618,7 +2191,6 @@ def _relaunch_without_console() -> None:
         return
     sys.exit(0)
 
-
 def _log_crash(exc_type, exc, tb) -> None:
     import traceback
     try:
@@ -1626,7 +2198,6 @@ def _log_crash(exc_type, exc, tb) -> None:
             fh.write("CRASH\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
     except Exception:
         pass
-
 
 def main() -> None:
     _relaunch_without_console()
@@ -1639,7 +2210,6 @@ def main() -> None:
     set_window_icon(root)
     root.after(300, lambda: set_window_icon(root))
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
