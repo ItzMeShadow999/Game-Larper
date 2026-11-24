@@ -959,7 +959,7 @@ class RowList(tk.Frame):
         return tuple(sorted(self.sel))
 
     def _visible(self) -> int:
-        return max(1, self.cv.winfo_height() 
+        return max(1, self.cv.winfo_height()
 
     def _index(self, y: int) -> int:
         i = self.top + y 
