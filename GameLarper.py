@@ -259,7 +259,7 @@ def token_forget() -> None:
 _PLATFORM_CTX = contextvars.ContextVar("larper_platform", default="Windows")
 _IDENTIFY_PATCHED = False
 
-DEPS_DIR = APP_DIR / "larper_deps"  
+DEPS_DIR = APP_DIR / "larper_deps"
 _PROBE = ("import discord, sys\nfrom discord.gateway import DiscordWebSocket\n"
           "sys.exit(0 if 'self' in str(getattr(discord, '__title__', '')) else 3)")
 _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
@@ -282,10 +282,10 @@ def selfbot_missing() -> str | None:
     """None if discord.py-self is usable, else a short reason. Checked in a subprocess so a wrong or broken
     global 'discord' package never gets imported into this process."""
     _use_deps_dir()
-    if FROZEN:  
+    if FROZEN:
         try:
             import discord
-            from discord.gateway import DiscordWebSocket  
+            from discord.gateway import DiscordWebSocket
             return None if "self" in str(getattr(discord, "__title__", "")) else "wrong 'discord' package"
         except Exception as exc:
             return str(exc)
@@ -324,7 +324,7 @@ def install_selfbot() -> tuple[bool, str]:
             return True, ""
         detail = f"{detail} | {missing}"
         if attempt == 1:
-            shutil.rmtree(DEPS_DIR, ignore_errors=True)  
+            shutil.rmtree(DEPS_DIR, ignore_errors=True)
     return False, detail
 
 def _install_identify_patch() -> None:
@@ -406,7 +406,7 @@ class GatewaySession(threading.Thread):
             self.ready.clear()
 
     def run(self) -> None:
-        _PLATFORM_CTX.set(self.platform)  
+        _PLATFORM_CTX.set(self.platform)
         try:
             _use_deps_dir()
             _install_identify_patch()
@@ -959,10 +959,10 @@ class RowList(tk.Frame):
         return tuple(sorted(self.sel))
 
     def _visible(self) -> int:
-        return max(1, self.cv.winfo_height()
+        return max(1, self.cv.winfo_height() // self.RH)
 
     def _index(self, y: int) -> int:
-        i = self.top + y 
+        i = self.top + y // self.RH
         return i if y >= 0 and i < len(self.items) else -1
 
     def _clamp_top(self) -> None:
@@ -1010,7 +1010,7 @@ class RowList(tk.Frame):
         y = e.y
         if y < 0 or y > self.cv.winfo_height():
             self._scroll(-1 if y < 0 else 1)
-        i = max(0, min(len(self.items) - 1, self.top + y 
+        i = max(0, min(len(self.items) - 1, self.top + y // self.RH))
         a, b = sorted((self.anchor, i))
         rng = set(range(a, b + 1))
         self.sel = self._base | rng if self._paint else self._base - rng
@@ -1051,7 +1051,7 @@ class RowList(tk.Frame):
             on = i in self.sel
             if on:
                 cv.create_rectangle(0, y, w, y + self.RH, fill=ACCENT, outline="")
-            cv.create_text(8, y + self.RH 
+            cv.create_text(8, y + self.RH // 2, anchor="w", text=self.items[i],
                            fill=BG if on else FG)
         if self.top <= self.hot < min(n, self.top + vis + 1):
             self._pop(self.hot, w)
@@ -1073,7 +1073,7 @@ class RowList(tk.Frame):
         right = [(x0 + x1 - px, y0 + y1 - py) for px, py in left]
         cv.create_polygon(left, fill=bar, outline="")
         cv.create_polygon(right, fill=bar, outline="")
-        cv.create_text(14, y0 + self.RH 
+        cv.create_text(14, y0 + self.RH // 2, anchor="w", text=self.items[i],
                        fill=BG if on else FG)
 
 def _listbox(parent, row: int) -> RowList:
@@ -1165,7 +1165,7 @@ class SpeedGraph(tk.Canvas):
         if w < 120 or h < 70:
             return
         left, top, right, bottom = 50, 22, w - 10, h - 18
-        fit = int((right - left) 
+        fit = int((right - left) // self.PX)
         shown = list(self.samples)[-fit:]
         vals = [v for _, v in shown]
         n = len(vals)
@@ -1199,9 +1199,9 @@ class SpeedGraph(tk.Canvas):
                 self.create_line(x, y, x, bottom - 1, fill="#5C1010", dash=(1, 2))
                 pts += [x, y]
             self.create_line(*pts, fill=ACCENT, width=1)
-            prev = int(shown[0][0]) 
+            prev = int(shown[0][0])
             for k, (t, _v) in enumerate(shown):
-                cur = int(t) 
+                cur = int(t)
                 if cur != prev:
                     x = left + k * self.PX
                     if left + 22 <= x <= right - 22:
@@ -1248,8 +1248,8 @@ class MsgDialog(tk.Toplevel):
             self.bind("<Escape>", lambda _e: self.destroy())
 
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         self.grab_set()
@@ -1301,8 +1301,8 @@ class StringDialog(tk.Toplevel):
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         entry.focus_set()
@@ -1349,8 +1349,8 @@ class DurationDialog(tk.Toplevel):
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         entry.focus_set()
@@ -1404,8 +1404,8 @@ class PlatformDialog(tk.Toplevel):
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         self.grab_set()
@@ -1456,8 +1456,8 @@ class TokenDialog(tk.Toplevel):
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) 
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) 
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         dark_titlebar(self)
         self.grab_set()
@@ -1481,8 +1481,8 @@ def center_window(root: tk.Tk, width: int, height: int) -> None:
     """Size the window and place it in the middle of the screen (shrinks to fit small screens)."""
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     width, height = min(width, sw - 40), min(height, sh - 80)
-    x = (sw - width) 
-    y = (sh - height) 
+    x = (sw - width) // 2
+    y = (sh - height) // 2
     root.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
 
 class App:
@@ -1502,7 +1502,7 @@ class App:
         self.visible: list[Game] = []
         self.queue: list[Game] = []
         self.stop_evt = threading.Event()
-        self.plat_now = "Windows"  
+        self.plat_now = "Windows"
         self.worker: threading.Thread | None = None
 
         self.search_var = tk.StringVar()
@@ -1661,7 +1661,7 @@ class App:
                 self.root.after(0, self._download_begin)
             self.graph.feed(done)
             total = total or max(est, done)
-            pct = done * 100 
+            pct = done * 100 // total
             self.live(name or "games.json", f"{done / 1048576:.1f}/{total / 1048576:.1f} MB {min(pct, 99):3d}%")
 
         before = CACHE_PATH.stat().st_mtime_ns if CACHE_PATH.exists() else None
@@ -1831,16 +1831,16 @@ class App:
         use_token = False
         if self.tok_mode.get():
             ready = self._token_ready()
-            if ready is None:  
+            if ready is None:
                 return
             use_token = ready
-        skip_plat = self.tok_mode.get() and not use_token  
+        skip_plat = self.tok_mode.get() and not use_token
         batch = list(self.queue)
         durations: list[float | None] = []
         platforms: list[str] = []
         text, plat, minutes = DEFAULT_MINUTES, "Windows", None
         time_all = plat_all = False
-        for i, g in enumerate(batch, 1):  
+        for i, g in enumerate(batch, 1):
             if not time_all:
                 dlg = DurationDialog(self.root, g.name, i, len(batch), text)
                 self.root.wait_window(dlg)
@@ -1907,7 +1907,7 @@ class App:
         if not self._live_label:
             return
         name, stats = self._live_label
-        cols = max(30, (self.log_box.winfo_width() - 24) 
+        cols = max(30, (self.log_box.winfo_width() - 24) // self._cw)
         room = cols - len(stats) - 1
         if len(name) > room:
             name = name[: max(1, room - 3)] + "..."
@@ -1955,7 +1955,7 @@ class App:
         missing = selfbot_missing()
         if missing:
             if self._deps_state == "failed":
-                self._deps_state = None  
+                self._deps_state = None
                 self.log(f"dependencies still missing ({missing}) | skipping platform larp")
                 return False
             self._begin_install(missing)
@@ -2098,12 +2098,12 @@ class App:
             return
         self.plat_now = name
         self.log(f"platform -> {name}")
-        self.stop_evt.wait(GAP_SECONDS)  
+        self.stop_evt.wait(GAP_SECONDS)
 
     def _run(self, batch: list[Game], durations: list[float | None], platforms: list[str]) -> None:
         try:
             if all(d is None for d in durations):
-                if len(set(platforms)) > 1:  
+                if len(set(platforms)) > 1:
                     self.log(f"all games run together, using {platforms[0]} for all")
                 self._platform(platforms[0])
                 started =[f for g in batch for f in self._launch_all(g)]
@@ -2152,7 +2152,7 @@ class App:
         finally:
             self.end_live()
             _cleanup_all()
-            self._platform("Windows")  
+            self._platform("Windows")
             self.root.after(0, self._finished)
 
     def _finished(self) -> None:
